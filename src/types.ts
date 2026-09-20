@@ -1,0 +1,76 @@
+// Public types of the S3 storage engine. Nothing here imports from the app.
+
+import type { Request } from 'express';
+import type { PutObjectCommandInput, S3Client } from '@aws-sdk/client-s3';
+
+/** Bytes handed to the HTTP layer for one file so far. */
+export interface S3UploadProgress {
+  loaded: number;
+  /**
+   * Total bytes of the file, when it is known. A single PUT knows it before the
+   * first byte goes out; a multipart upload of a stream learns it only at the end,
+   * so a caller that needs a percentage should pass the size it already has.
+   */
+  total?: number;
+
+  /** Part number of a multipart upload. A single PUT reports 1. */
+  part: number;
+  /** True once the object is stored, which is after the last byte is sent. */
+  done: boolean;
+}
+
+export type S3Resolver<T> = (req: Request, file: Express.Multer.File) => T | Promise<T>;
+
+export interface S3StorageOptions {
+  /**
+   * The client the engine sends with. Build it however you like: the engine
+   * neither modifies it nor asks anything of it, and its retries still work.
+   *
+   * With Cloudflare R2, `requestChecksumCalculation: 'WHEN_REQUIRED'` is worth
+   * setting. The default adds a CRC32 trailer that strips `content-length` from
+   * a streamed body, which can fail over a slow link with `InvalidChunkSizeError`.
+   */
+  client: S3Client;
+  bucket: string | S3Resolver<string>;
+  /** Object key. The caller owns naming, including making it unique. */
+  key: S3Resolver<string>;
+  /**
+   * Content type of the stored object. Defaults to `file.mimetype`, which is
+   * what the caller has already decided about this file.
+   */
+  contentType?: S3Resolver<string | undefined>;
+  /** Anything else the caller wants on the request: metadata, cache control, tags. */
+  params?: S3Resolver<Partial<PutObjectCommandInput>>;
+  /** Bytes buffered before the upload is sent as multipart. Minimum and default 5 MiB. */
+  partSize?: number;
+  /** Concurrent part uploads of a multipart upload. Default 4. */
+  queueSize?: number;
+  /**
+   * Attempts for a single PUT, including the first. Default 3.
+   *
+   * The engine retries this call itself because the SDK never retries a request
+   * it has streamed: it cannot know the body can be sent again. The parts of a
+   * multipart upload are sent as buffers, so those are left to the client.
+   */
+  attempts?: number;
+  /**
+   * Called as bytes leave for the bucket, at most once per 64 KiB, and once more
+   * when the object is stored.
+   */
+  onProgress?: (progress: S3UploadProgress, file: Express.Multer.File, req: Request) => void;
+}
+
+/**
+ * What the engine adds to `file` once the object is stored.
+ *
+ * No `location`, which `multer-s3` provides: a URL is only meaningful for a
+ * public bucket, and building one takes endpoint rules this engine would have to
+ * duplicate. Compose it from `bucket` and `key`, or sign one.
+ */
+export interface S3StoredFile {
+  bucket: string;
+  key: string;
+  size: number;
+  contentType?: string;
+  etag?: string;
+}
