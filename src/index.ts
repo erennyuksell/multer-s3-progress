@@ -9,7 +9,16 @@
 import './multer-file';
 
 export { s3Storage } from './engine';
-export type { S3StorageOptions, S3StoredFile, S3Resolver, S3UploadProgress } from './types';
+export type {
+  S3StorageOptions,
+  S3StoredFile,
+  S3Resolver,
+  S3ContentTypeResolver,
+  S3UploadProgress,
+} from './types';
+
+// Opt in to storing what a file turns out to be. Needs `file-type` installed.
+export { AUTO_CONTENT_TYPE } from './content-type';
 
 // Useful on its own to anyone sending with lib-storage: it turns its per part
 // progress into per slice progress without touching the client it is given.

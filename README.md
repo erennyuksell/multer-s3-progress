@@ -117,8 +117,29 @@ const engine = s3Storage({
 });
 ```
 
-`contentType` defaults to `file.mimetype`, which is whatever the caller decided
-about the file, so content detection stays out of this engine.
+`contentType` defaults to `file.mimetype`, which is what the client called the
+file. To store what it turns out to be instead:
+
+```bash
+npm install file-type   # 21.x on node 20, 22.x on node 22
+```
+
+```ts
+import { s3Storage, AUTO_CONTENT_TYPE } from 'multer-s3-progress';
+
+s3Storage({ client, bucket, key, contentType: AUTO_CONTENT_TYPE });
+```
+
+`file-type` is an optional peer dependency, loaded only when a file is stored
+this way. It is not pinned here: it has been ESM only since 17 and its node
+requirement moves, so the version is yours to choose, and the dynamic import
+keeps it working from a CommonJS application.
+
+Or decide yourself: `contentType` is `(req, file, head) => string | undefined`,
+where `head` is the start of the file the engine had buffered anyway. That is
+the one place the shape differs from `multer-s3`, whose version took a callback
+and had to hand back a replacement stream because it had consumed the real one
+to see those bytes. Here they are already in hand, so nothing is taken apart.
 
 Importing the package also types what it puts on the file, so `req.file.key`
 and `req.file.bucket` read without a cast. They are optional, because multer's
@@ -175,9 +196,12 @@ differences:
   building one takes endpoint rules this engine would rather not duplicate, so
   it would have been right on one code path and missing on the other. Compose it
   from `file.bucket` and `file.key`, or sign one.
-- **No content type detection.** `multer-s3` had `AUTO_CONTENT_TYPE`, which read
-  the first bytes of the file. `contentType` defaults to `file.mimetype` and
-  takes a function, so detection stays a decision of the caller.
+- **`AUTO_CONTENT_TYPE` reads more of the file.** `multer-s3` took the first
+  chunk off the stream and had `file-type` 3.9.0 pinned into it, which is a
+  release from 2018 and part of why that package could not move. Here the bytes
+  are the ones the engine had buffered anyway, megabytes rather than one chunk,
+  and `file-type` is an optional peer dependency at whatever version you want.
+  It matters: a `.docx` read a few kilobytes in is only a zip.
 
 `file.bucket`, `file.key`, `file.size`, `file.contentType` and `file.etag` are
 set as before, and `size` is now the real size rather than 0 on a large file.

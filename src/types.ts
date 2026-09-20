@@ -21,6 +21,19 @@ export interface S3UploadProgress {
 
 export type S3Resolver<T> = (req: Request, file: Express.Multer.File) => T | Promise<T>;
 
+/**
+ * Decides the content type of a file with the start of it in hand.
+ *
+ * `head` is what the engine had to buffer anyway: the whole file when it fits
+ * in one part, its first `partSize` bytes when it does not. Returning undefined
+ * stores the object without a content type.
+ */
+export type S3ContentTypeResolver = (
+  req: Request,
+  file: Express.Multer.File,
+  head: Buffer,
+) => string | undefined | Promise<string | undefined>;
+
 export interface S3StorageOptions {
   /**
    * The client the engine sends with. Build it however you like: the engine
@@ -36,9 +49,11 @@ export interface S3StorageOptions {
   key: S3Resolver<string>;
   /**
    * Content type of the stored object. Defaults to `file.mimetype`, which is
-   * what the caller has already decided about this file.
+   * what the client called the file.
+   *
+   * Pass `AUTO_CONTENT_TYPE` to store what the bytes say instead.
    */
-  contentType?: S3Resolver<string | undefined>;
+  contentType?: S3ContentTypeResolver;
   /** Anything else the caller wants on the request: metadata, cache control, tags. */
   params?: S3Resolver<Partial<PutObjectCommandInput>>;
   /** Bytes buffered before the upload is sent as multipart. Minimum and default 5 MiB. */

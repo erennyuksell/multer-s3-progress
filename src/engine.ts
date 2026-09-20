@@ -31,21 +31,37 @@ interface ResolvedTarget {
   extra: Partial<PutObjectCommand['input']>;
 }
 
+/** Everything that can be known before a byte of the file has been read. */
 async function resolveTarget(
   options: S3StorageOptions,
   req: Request,
   file: Express.Multer.File,
-): Promise<ResolvedTarget> {
+): Promise<Omit<ResolvedTarget, 'contentType'>> {
   const bucket =
     typeof options.bucket === 'function' ? await options.bucket(req, file) : options.bucket;
   const key = await options.key(req, file);
-  const contentType = options.contentType ? await options.contentType(req, file) : file.mimetype;
   const extra = options.params ? await options.params(req, file) : {};
 
   if (!bucket) throw new Error('s3-engine: bucket is empty');
   if (!key) throw new Error('s3-engine: key is empty');
 
-  return { bucket, key, contentType, extra };
+  return { bucket, key, extra };
+}
+
+/**
+ * Settled once the start of the file is in hand, so a resolver can read it.
+ *
+ * Waiting costs nothing: those bytes are buffered for the size either way, and
+ * nothing has gone to the bucket yet.
+ */
+async function resolveContentType(
+  options: S3StorageOptions,
+  req: Request,
+  file: Express.Multer.File,
+  head: Buffer,
+): Promise<string | undefined> {
+  if (!options.contentType) return file.mimetype;
+  return options.contentType(req, file, head);
 }
 
 /**
@@ -255,20 +271,30 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
       });
 
       resolveTarget(options, req as Request, file).then(
-        (target) => {
+        (base) => {
           readUpTo(source, partSize, (readErr, head, ended, rest) => {
             if (readErr) {
               cb(readErr);
               return;
             }
 
-            const stored = ended
-              ? putWhole(req as Request, file, target, head, abort)
-              : putMultipart(req as Request, file, target, rest, abort);
+            resolveContentType(options, req as Request, file, head).then(
+              (contentType) => {
+                const target: ResolvedTarget = { ...base, contentType };
+                const stored = ended
+                  ? putWhole(req as Request, file, target, head, abort)
+                  : putMultipart(req as Request, file, target, rest, abort);
 
-            stored.then(
-              (info) => cb(null, info as Partial<Express.Multer.File>),
-              (err: Error) => cb(err),
+                stored.then(
+                  (info) => cb(null, info as Partial<Express.Multer.File>),
+                  (err: Error) => cb(err),
+                );
+              },
+              (err: Error) => {
+                // Drain, so busboy can read past this file to the rest of the body.
+                rest.resume();
+                cb(err);
+              },
             );
           });
         },

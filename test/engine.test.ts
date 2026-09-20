@@ -8,7 +8,12 @@ import { PassThrough, Readable } from 'stream';
 import { S3Client } from '@aws-sdk/client-s3';
 import type { StorageEngine } from 'multer';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { s3Storage, type S3StoredFile, type S3UploadProgress } from '../src/index';
+import {
+  AUTO_CONTENT_TYPE,
+  s3Storage,
+  type S3StoredFile,
+  type S3UploadProgress,
+} from '../src/index';
 import { close, createFakeS3, type FakeS3Behavior, listen } from './fake-s3';
 
 const MB = 1024 * 1024;
@@ -197,6 +202,32 @@ describe('s3-engine', () => {
 
     await expect(stored).rejects.toThrow();
     expect(objects.has(key)).toBe(false);
+  });
+
+  it('stores the type the bytes turned out to be when asked to', async () => {
+    // A real 1x1 PNG: file-type reads past the signature to tell PNG from APNG.
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    const engineUnderTest = s3Storage({
+      client,
+      bucket: BUCKET,
+      key: () => key,
+      contentType: AUTO_CONTENT_TYPE,
+    });
+
+    // The client called it a nameless blob, which is what is sent when nothing
+    // knows any better.
+    const stored = await handle(engineUnderTest, fileFrom(Readable.from([png])));
+
+    expect(stored.contentType).toBe('image/png');
+  });
+
+  it('stores what the client called the file when it is not asked to look', async () => {
+    const stored = await handle(engine(), fileFrom(bytesInChunks(4096)));
+
+    expect(stored.contentType).toBe('application/octet-stream');
   });
 
   it('deletes the object it stored when multer rolls the request back', async () => {
