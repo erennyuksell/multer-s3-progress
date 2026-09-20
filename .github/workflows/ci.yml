@@ -10,7 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: [18, 20, 22]
+        # What the toolchain runs on: vitest 5 needs 22.12 or newer.
+        node: [22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,3 +24,13 @@ jobs:
       - run: npm run format:check
       - run: npm test
       - run: npm run build
+
+      # The package itself claims node 18, which the test toolchain cannot run
+      # on, so what is checked there is that the built output loads.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: the built package loads on the oldest node it claims
+        run: |
+          node -e "const m = require('./dist/index.cjs'); if (typeof m.s3Storage !== 'function') throw new Error('cjs export missing')"
+          node --input-type=module -e "const m = await import(process.cwd() + '/dist/index.js'); if (typeof m.s3Storage !== 'function') throw new Error('esm export missing')"
