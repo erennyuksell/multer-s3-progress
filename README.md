@@ -32,8 +32,11 @@ library learns of progress only when a part is stored, so:
 - a larger file is stored correctly but comes back with `size: 0`,
 - the caller cannot tell a slow upload from a stuck one.
 
-Open issues and pull requests upstream: anacronw/multer-s3 #65, #114, #164,
-#204, #208.
+Asked for upstream more than once: progress events in
+[#65](https://github.com/anacronw/multer-s3/issues/65) and [#114](https://github.com/anacronw/multer-s3/issues/114), both closed without one; the
+size of a multipart upload in [#204](https://github.com/anacronw/multer-s3/pull/204), an open pull request, and
+[#208](https://github.com/anacronw/multer-s3/issues/208); an upload cancelled part way leaving a zero byte object
+behind in [#164](https://github.com/anacronw/multer-s3/issues/164).
 
 ## How it works
 
