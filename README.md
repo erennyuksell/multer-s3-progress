@@ -146,6 +146,19 @@ Two details are worth knowing:
   trailer also replaces `content-length` on a streamed body, which has been
   reported to fail over a slow link with `InvalidChunkSizeError` since SDK 3.729.
 
+## About multer
+
+`multer` 2.1.0 or newer, which is the first release that notices a client going
+away mid upload. Before it, busboy stops feeding the file stream without ending
+it, so the engine never hears that the file is over: the request waits for a
+write that never finishes and the multipart upload sits open in the bucket. From
+2.1.0 multer fails the request and destroys the file stream, which this engine
+takes as its signal to abort. There is a test for it.
+
+The same release added `defParamCharset`. Pass `defParamCharset: 'utf8'` to
+multer if your users upload files with non ASCII names, or "Haritasi.pdf" with a
+Turkish dotless i reaches your `key` function one character per byte.
+
 ## Coming from multer-s3
 
 The options are the same shape: `bucket`, `key`, `contentType`, `params`. Two
