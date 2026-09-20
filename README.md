@@ -155,9 +155,13 @@ write that never finishes and the multipart upload sits open in the bucket. From
 2.1.0 multer fails the request and destroys the file stream, which this engine
 takes as its signal to abort. There is a test for it.
 
-The same release added `defParamCharset`. Pass `defParamCharset: 'utf8'` to
-multer if your users upload files with non ASCII names, or "Haritasi.pdf" with a
-Turkish dotless i reaches your `key` function one character per byte.
+The same release added `defParamCharset`. Without it a filename is read as
+latin1, so a name written in UTF-8 by the browser reaches your `key` function one
+character per byte. Passing `'utf8'` fixes that at the source, but it is not
+strictly better: latin1 keeps the bytes as they arrived, so a name a client
+really did send in latin1 survives and can be repaired afterwards, while utf8
+turns it into replacement characters that cannot. Pass it when you know your
+clients send UTF-8, which browsers do.
 
 ## Coming from multer-s3
 
