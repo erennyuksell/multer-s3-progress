@@ -213,7 +213,8 @@ bytes were stored and deleted, and after 10.6 s when stopped at the limit alone.
 With `fileSize`, `files` and `fields` in `limits`, the engine works out the
 largest body a request within them can have and refuses a larger
 `Content-Length` at once, with multer's own `MulterError('LIMIT_FILE_SIZE')`, so
-your error handling sees the error it already knows.
+your error handling sees the error it already knows. The same 25.5 MB file was
+refused in 0.04 s, and a file just under the limit was still stored.
 
 It needs the counts because it must never refuse a request that fits. Without
 `files` and `fields` the text in a request has no bound, so the check is
