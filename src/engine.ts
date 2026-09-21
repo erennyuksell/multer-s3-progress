@@ -13,7 +13,7 @@
 // else arrives through options, so the folder can be published as it is.
 
 import type { Request } from 'express';
-import type { StorageEngine } from 'multer';
+import { MulterError, type StorageEngine } from 'multer';
 import { PassThrough, Readable, Transform, finished } from 'stream';
 import { DeleteObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
@@ -128,6 +128,31 @@ function readUpTo(
   );
 }
 
+/**
+ * Room for the framing of one part of a multipart body: the boundary line and
+ * the part's headers. A boundary is at most 70 characters (RFC 2046) and a field
+ * name 100 bytes (multer's `fieldNameSize`); a filename has no limit in multer,
+ * but a file system's 255 bytes, percent-encoded by the browser, still fits.
+ */
+const PART_FRAMING = 4 * 1024;
+
+/** multer's default `fieldSize`. */
+const MULTER_FIELD_SIZE = 1024 * 1024;
+
+/**
+ * The largest body a request within `limits` can have, or null when it has no
+ * bound: without a count of files and of fields, text of any size could come
+ * with the files, and a guess could refuse a request that fits.
+ */
+function largestBody(limits: S3StorageOptions['limits']): number | null {
+  const { fileSize, files, fields } = limits ?? {};
+  if (fileSize === undefined || files === undefined || fields === undefined) return null;
+  const fieldSize = limits?.fieldSize ?? MULTER_FIELD_SIZE;
+  const body =
+    files * (fileSize + PART_FRAMING) + fields * (fieldSize + PART_FRAMING) + PART_FRAMING;
+  return Number.isFinite(body) ? body : null;
+}
+
 /** A 4xx other than 429 is the caller's fault and will fail again the same way. */
 function isRetryable(error: unknown): boolean {
   const status = (error as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode;
@@ -139,6 +164,7 @@ function isRetryable(error: unknown): boolean {
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function s3Storage(options: S3StorageOptions): StorageEngine {
+  const bodyCeiling = largestBody(options.limits);
   const partSize = Math.max(options.partSize ?? MIN_PART_SIZE, MIN_PART_SIZE);
   const attempts = Math.max(options.attempts ?? DEFAULT_ATTEMPTS, 1);
 
@@ -270,6 +296,20 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
   return {
     _handleFile(req, file, cb) {
       const source = file.stream;
+
+      // multer notices a file over `fileSize` only once it has read that far,
+      // and above `partSize * queueSize` bytes the engine gets that far only as
+      // fast as the bucket takes the parts before it: against R2, a 25.5 MB file
+      // over a 25 MB limit was refused after 10.6 s. A body larger than any
+      // request within the limits can be refused before a byte is read.
+      const declared = bodyCeiling === null ? NaN : Number(req.headers?.['content-length']);
+      if (bodyCeiling !== null && Number.isFinite(declared) && declared > bodyCeiling) {
+        // Drain, so busboy can read past this file to the rest of the body.
+        source.resume();
+        cb(new MulterError('LIMIT_FILE_SIZE', file.fieldname));
+        return;
+      }
+
       const abort = new AbortController();
       // The request is over for this file either way: stop the upload rather
       // than leave parts in the bucket that are neither completed nor aborted.
@@ -293,7 +333,7 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
         // Drain, so busboy can read past this file to the rest of the body.
         source.unpipe();
         source.resume();
-        cb(Object.assign(new Error('File too large'), { code: 'LIMIT_FILE_SIZE' }));
+        cb(new MulterError('LIMIT_FILE_SIZE', file.fieldname));
       };
 
       resolveTarget(options, req as Request, file).then(

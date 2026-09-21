@@ -54,15 +54,31 @@ describe('a file over the size limit', () => {
       forcePathStyle: true,
       requestChecksumCalculation: 'WHEN_REQUIRED',
     });
-    const storage = s3Storage({ client, bucket: BUCKET, key: () => `limit-${++keys}.bin` });
+    const key = () => `limit-${++keys}.bin`;
 
     const server = express();
-    const routes: Array<[string, number]> = [
+    // Unbounded: only `fileSize`, as most apps pass it. The engine is not told.
+    const unbounded: Array<[string, number]> = [
       ['/multipart', 7 * MB],
       ['/single', 1 * MB],
     ];
-    for (const [path, fileSize] of routes) {
+    for (const [path, fileSize] of unbounded) {
+      const storage = s3Storage({ client, bucket: BUCKET, key });
       server.post(path, multer({ storage, limits: { fileSize } }).single('file'), (_req, res) => {
+        res.json({ stored: true });
+      });
+    }
+    // Bounded: the counts are given, and the same limits go to multer and the engine.
+    // One part in flight at a time, so without the check the limit would be reached
+    // only after the bucket took the part before it.
+    const bounded: Array<[string, multer.Options['limits']]> = [
+      ['/bounded', { fileSize: 7 * MB, files: 1, fields: 0 }],
+      ['/bounded-small', { fileSize: 1 * MB, files: 1, fields: 0 }],
+      ['/bounded-fields', { fileSize: 1 * MB, files: 1, fields: 2, fieldSize: 100 }],
+    ];
+    for (const [path, limits] of bounded) {
+      const storage = s3Storage({ client, bucket: BUCKET, key, limits, queueSize: 1 });
+      server.post(path, multer({ storage, limits }).single('file'), (_req, res) => {
         res.json({ stored: true });
       });
     }
@@ -93,8 +109,9 @@ describe('a file over the size limit', () => {
     }
   }
 
-  async function upload(path: string, bytes: number) {
+  async function upload(path: string, bytes: number, fields: Record<string, string> = {}) {
     const form = new FormData();
+    for (const [name, value] of Object.entries(fields)) form.append(name, value);
     form.append('file', new Blob([new Uint8Array(bytes).fill(7)]), 'big.bin');
     const started = Date.now();
     const res = await fetch(`${baseUrl}${path}`, { method: 'POST', body: form });
@@ -123,4 +140,38 @@ describe('a file over the size limit', () => {
     expect(calls).not.toContain('DeleteObject');
     expect(objects.size).toBe(0);
   }, 20000);
+
+  it('is refused before the bucket hears of it when the body cannot fit the limits', async () => {
+    const reply = await upload('/bounded', 12 * MB);
+
+    expect(reply.status).toBe(400);
+    expect(reply.body).toEqual({ code: 'LIMIT_FILE_SIZE' });
+    expect(reply.elapsed).toBeLessThan(PART_DELAY_MS);
+    expect(calls).toEqual([]);
+    expect(objects.size).toBe(0);
+  }, 20000);
+
+  it('stores a file of exactly the limit, which fits', async () => {
+    const reply = await upload('/bounded-small', 1 * MB);
+
+    expect(reply.status).toBe(200);
+    expect(objects.size).toBe(1);
+  });
+
+  it('refuses a file just over the limit without sending it', async () => {
+    const reply = await upload('/bounded-small', 1 * MB + 16 * 1024);
+
+    expect(reply.status).toBe(400);
+    expect(reply.body).toEqual({ code: 'LIMIT_FILE_SIZE' });
+    expect(calls).toEqual([]);
+  });
+
+  it('counts the fields the limits allow as part of a body that fits', async () => {
+    // multer refuses a field of exactly `fieldSize` (unlike a file, it gets no extra byte).
+    const text = 'x'.repeat(99);
+    const reply = await upload('/bounded-fields', 1 * MB, { name: text, type: text });
+
+    expect(reply.status).toBe(200);
+    expect(objects.size).toBe(1);
+  });
 });

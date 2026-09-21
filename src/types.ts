@@ -2,6 +2,7 @@
 
 import type { Request } from 'express';
 import type { PutObjectCommandInput, S3Client } from '@aws-sdk/client-s3';
+import type { Options } from 'multer';
 
 /** Bytes handed to the HTTP layer for one file so far. */
 export interface S3UploadProgress {
@@ -73,6 +74,18 @@ export interface S3StorageOptions {
    * when the object is stored.
    */
   onProgress?: (progress: S3UploadProgress, file: Express.Multer.File, req: Request) => void;
+  /**
+   * The `limits` you give multer. The engine cannot read them from multer, so
+   * pass the same object to both.
+   *
+   * With `fileSize`, `files` and `fields` set, the engine works out the largest
+   * body a request within them can have, and refuses a larger `Content-Length`
+   * with multer's own `LIMIT_FILE_SIZE` before a byte reaches the bucket. Without
+   * the counts the text in a request has no bound, so it skips that check rather
+   * than risk refusing a request that fits. Either way a file cut off at
+   * `fileSize` is stopped there and never stored.
+   */
+  limits?: Options['limits'];
 }
 
 /**
