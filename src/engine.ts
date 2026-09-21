@@ -221,6 +221,13 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
     finished(body, { writable: false }, (err) => {
       if (err) counted.destroy();
     });
+    // lib-storage aborts the upload in the bucket only once the body it reads
+    // is over. A stop that leaves the body open (multer's size limit) would
+    // leave it waiting for bytes forever, and the parts sent so far in the
+    // bucket, neither completed nor aborted.
+    abort.signal.addEventListener('abort', () => counted.destroy(new Error('Upload stopped')), {
+      once: true,
+    });
 
     const upload = new Upload({
       client: countingClient(options.client),
@@ -270,6 +277,25 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
         if (err) abort.abort();
       });
 
+      // busboy ends a file cut off by multer's size limit as if it were whole:
+      // it emits 'limit', marks the stream truncated and ends it normally. Stop
+      // there, so the cut-off bytes are never stored, and multer, which waits for
+      // this file before it answers, is not kept waiting on the bucket for a file
+      // it is about to reject. `truncated` covers a limit reached before this ran.
+      let limitReached = false;
+      source.once('limit', () => {
+        limitReached = true;
+        abort.abort();
+      });
+      const overLimit = () =>
+        limitReached || (source as { truncated?: boolean }).truncated === true;
+      const rejectOverLimit = () => {
+        // Drain, so busboy can read past this file to the rest of the body.
+        source.unpipe();
+        source.resume();
+        cb(Object.assign(new Error('File too large'), { code: 'LIMIT_FILE_SIZE' }));
+      };
+
       resolveTarget(options, req as Request, file).then(
         (base) => {
           readUpTo(source, partSize, (readErr, head, ended, rest) => {
@@ -277,9 +303,17 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
               cb(readErr);
               return;
             }
+            if (overLimit()) {
+              rejectOverLimit();
+              return;
+            }
 
             resolveContentType(options, req as Request, file, head).then(
               (contentType) => {
+                if (overLimit()) {
+                  rejectOverLimit();
+                  return;
+                }
                 const target: ResolvedTarget = { ...base, contentType };
                 const stored = ended
                   ? putWhole(req as Request, file, target, head, abort)
@@ -287,7 +321,7 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
 
                 stored.then(
                   (info) => cb(null, info as Partial<Express.Multer.File>),
-                  (err: Error) => cb(err),
+                  (err: Error) => (overLimit() ? rejectOverLimit() : cb(err)),
                 );
               },
               (err: Error) => {

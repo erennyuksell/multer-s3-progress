@@ -179,6 +179,16 @@ write that never finishes and the multipart upload sits open in the bucket. From
 2.1.0 multer fails the request and destroys the file stream, which this engine
 takes as its signal to abort. There is a test for it.
 
+A file over `limits.fileSize` is stopped where it goes over. busboy does not
+fail the stream at the limit: it emits `'limit'`, marks the stream `truncated`
+and ends it as if the file were whole. Taken as an ordinary end, the cut-off
+bytes would be stored, and multer, which waits for the engine before it answers,
+would say "too large" only once they were in the bucket and deleted again. The
+engine aborts the upload on `'limit'` instead, so nothing is stored and the
+answer does not wait for the bucket. If you wrap this engine and hand it a
+stream of your own in place of `file.stream`, forward that event and the
+`truncated` flag, or the engine cannot see the limit.
+
 The same release added `defParamCharset`. Without it a filename is read as
 latin1, so a name written in UTF-8 by the browser reaches your `key` function one
 character per byte. Passing `'utf8'` fixes that at the source, but it is not
