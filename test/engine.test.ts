@@ -56,6 +56,7 @@ function remove(engine: StorageEngine, stored: S3StoredFile): Promise<void> {
 
 describe('s3-engine', () => {
   const objects = new Map<string, number>();
+  const versionCount = new Map<string, number>();
   const behavior: FakeS3Behavior = { failDeletes: false };
   let events: S3UploadProgress[] = [];
   let fakeS3: http.Server;
@@ -71,7 +72,7 @@ describe('s3-engine', () => {
   ) => s3Storage({ client, bucket: BUCKET, key: () => key, onProgress });
 
   beforeAll(async () => {
-    fakeS3 = createFakeS3(objects, behavior);
+    fakeS3 = createFakeS3(objects, behavior, versionCount);
     const endpoint = await listen(fakeS3);
     client = new S3Client({
       region: 'auto',
@@ -89,10 +90,14 @@ describe('s3-engine', () => {
 
   beforeEach(() => {
     objects.clear();
+    versionCount.clear();
     events = [];
     behavior.failDeletes = false;
     behavior.failPutsBefore = 0;
+    behavior.storeThenFailPuts = 0;
     behavior.failPartsBefore = 0;
+    behavior.versioned = false;
+    behavior.denyVersionDeletes = undefined;
     keys += 1;
     key = `spec-${keys}.bin`;
   });
@@ -147,6 +152,24 @@ describe('s3-engine', () => {
     // engine's own retry, with the body rebuilt for the second attempt.
     expect(stored.size).toBe(bytes);
     expect(objects.get(key)).toBe(bytes);
+  });
+
+  it('does not store a file twice when a PUT that failed had stored it', async () => {
+    behavior.versioned = true;
+    behavior.storeThenFailPuts = 1;
+    const engineUnderTest = engine();
+
+    const stored = await handle(engineUnderTest, fileFrom(bytesInChunks(4096)));
+
+    // Asked before sending again, the bucket said the file was there: one
+    // version, and it is the one the engine reports, so a rollback removes it.
+    expect(versionCount.get(key)).toBe(1);
+    expect(stored.versionId).toBeDefined();
+    expect(events[events.length - 1]).toEqual({ loaded: 4096, total: 4096, part: 1, done: true });
+
+    await remove(engineUnderTest, stored);
+
+    expect(objects.has(key)).toBe(false);
   });
 
   it('retries a part of a multipart upload the bucket refused', async () => {
@@ -230,6 +253,43 @@ describe('s3-engine', () => {
     expect(stored.contentType).toBe('application/octet-stream');
   });
 
+  it('stores the file when params has nothing to add and says so with undefined', async () => {
+    const engineUnderTest = s3Storage({
+      client,
+      bucket: BUCKET,
+      key: () => key,
+      params: () => undefined as never,
+    });
+
+    const stored = await handle(engineUnderTest, fileFrom(bytesInChunks(4096)));
+
+    expect(stored.size).toBe(4096);
+    expect(objects.get(key)).toBe(4096);
+  });
+
+  it('fails the upload, not the process, when a resolver answers nonsense', async () => {
+    const badType = s3Storage({
+      client,
+      bucket: BUCKET,
+      key: () => key,
+      contentType: () => 42 as never,
+    });
+    const badParams = s3Storage({
+      client,
+      bucket: BUCKET,
+      key: () => key,
+      params: () => 'x' as never,
+    });
+
+    await expect(handle(badType, fileFrom(bytesInChunks(4096)))).rejects.toThrow(
+      /contentType must resolve/,
+    );
+    await expect(handle(badParams, fileFrom(bytesInChunks(4096)))).rejects.toThrow(
+      /params must resolve/,
+    );
+    expect(objects.has(key)).toBe(false);
+  });
+
   it('deletes the object it stored when multer rolls the request back', async () => {
     const engineUnderTest = engine();
     const stored = await handle(engineUnderTest, fileFrom(bytesInChunks(4096)));
@@ -238,6 +298,61 @@ describe('s3-engine', () => {
     await remove(engineUnderTest, stored);
 
     expect(objects.has(key)).toBe(false);
+  });
+
+  it('returns the version a versioned bucket gave the object, single PUT and multipart', async () => {
+    behavior.versioned = true;
+
+    const whole = await handle(engine(), fileFrom(bytesInChunks(4096)));
+    const multipart = await handle(engine(), fileFrom(bytesInChunks(5 * MB + 1)));
+
+    expect(whole.versionId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(multipart.versionId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(multipart.versionId).not.toBe(whole.versionId);
+  }, 30000);
+
+  it('rolls back only its own version, so an object the key held before comes back', async () => {
+    behavior.versioned = true;
+    const engineUnderTest = engine();
+    await handle(engineUnderTest, fileFrom(bytesInChunks(1000)));
+    const stored = await handle(engineUnderTest, fileFrom(bytesInChunks(4096)));
+    expect(objects.get(key)).toBe(4096);
+
+    await remove(engineUnderTest, stored);
+
+    expect(objects.get(key)).toBe(1000);
+  });
+
+  it.each([403, 400] as const)(
+    'hides its version behind a delete marker when the bucket refuses to delete a version (%i)',
+    async (status) => {
+      behavior.versioned = true;
+      behavior.denyVersionDeletes = status;
+      const engineUnderTest = engine();
+      await handle(engineUnderTest, fileFrom(bytesInChunks(1000)));
+      const stored = await handle(engineUnderTest, fileFrom(bytesInChunks(4096)));
+
+      await remove(engineUnderTest, stored);
+
+      // The object before it is hidden too, but the rolled back file is not left current.
+      expect(objects.has(key)).toBe(false);
+    },
+  );
+
+  it('reports a rollback the bucket refused altogether', async () => {
+    behavior.versioned = true;
+    const engineUnderTest = engine();
+    const stored = await handle(engineUnderTest, fileFrom(bytesInChunks(4096)));
+    behavior.failDeletes = true;
+
+    await expect(remove(engineUnderTest, stored)).rejects.toThrow();
+    expect(objects.get(key)).toBe(4096);
+  });
+
+  it('sets no version when the bucket keeps none', async () => {
+    const stored = await handle(engine(), fileFrom(bytesInChunks(4096)));
+
+    expect(stored.versionId).toBeUndefined();
   });
 
   it('leaves the client it was given alone', async () => {

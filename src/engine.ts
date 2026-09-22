@@ -14,8 +14,14 @@
 
 import type { Request } from 'express';
 import { MulterError, type StorageEngine } from 'multer';
+import { createHash } from 'crypto';
 import { PassThrough, Readable, Transform, finished } from 'stream';
-import { DeleteObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import {
+  DeleteObjectCommand,
+  HeadObjectCommand,
+  PutObjectCommand,
+  type HeadObjectCommandOutput,
+} from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { countedBody, countingClient } from './counting-client';
 import type { S3StorageOptions, S3StoredFile, S3UploadProgress } from './types';
@@ -40,10 +46,12 @@ async function resolveTarget(
   const bucket =
     typeof options.bucket === 'function' ? await options.bucket(req, file) : options.bucket;
   const key = await options.key(req, file);
-  const extra = options.params ? await options.params(req, file) : {};
+  // A resolver with nothing to add may well say so with undefined.
+  const extra = (options.params ? await options.params(req, file) : undefined) ?? {};
 
   if (!bucket) throw new Error('s3-engine: bucket is empty');
   if (!key) throw new Error('s3-engine: key is empty');
+  if (typeof extra !== 'object') throw new TypeError('s3-engine: params must resolve to an object');
 
   return { bucket, key, extra };
 }
@@ -61,7 +69,11 @@ async function resolveContentType(
   head: Buffer,
 ): Promise<string | undefined> {
   if (!options.contentType) return file.mimetype;
-  return options.contentType(req, file, head);
+  const contentType = await options.contentType(req, file, head);
+  if (contentType !== undefined && typeof contentType !== 'string') {
+    throw new TypeError('s3-engine: contentType must resolve to a string or undefined');
+  }
+  return contentType;
 }
 
 /**
@@ -161,6 +173,16 @@ function isRetryable(error: unknown): boolean {
   return status === 429 || status >= 500;
 }
 
+/**
+ * A delete the bucket refused, rather than failed at: MFA Delete, Object Lock
+ * and a policy without the permission answer 403 on AWS, and MinIO answers a
+ * version under Object Lock with 400. A 404 is no refusal: the version is gone.
+ */
+function isRefusal(error: unknown): boolean {
+  const status = (error as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode;
+  return typeof status === 'number' && status >= 400 && status < 500 && status !== 404;
+}
+
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function s3Storage(options: S3StorageOptions): StorageEngine {
@@ -177,6 +199,40 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
     }
   };
 
+  /**
+   * The object under the key, when it holds exactly these bytes.
+   *
+   * A PUT can fail after the bucket stored it: the connection drops after the
+   * last byte, or the answer is lost. Sent again, the file would be stored
+   * twice, and in a bucket that keeps versions the first copy is a version the
+   * engine never hears of, which a rollback of the second leaves current. A
+   * HEAD settles it: the same size, type and MD5 ETag mean the file is there.
+   *
+   * No answer means "cannot tell", and the PUT is sent again as before: the
+   * HEAD can be refused (it needs `s3:GetObject`), and an ETag is not the MD5
+   * under SSE-KMS or SSE-C. The same bytes stored under the key by someone else
+   * just before would pass too, which is harmless: the object is the file.
+   */
+  async function findStored(
+    target: ResolvedTarget,
+    body: Buffer,
+  ): Promise<HeadObjectCommandOutput | undefined> {
+    try {
+      const head = await options.client.send(
+        new HeadObjectCommand({ Bucket: target.bucket, Key: target.key }),
+      );
+      // Inside the try: MD5 throws in a node built for FIPS.
+      const md5 = `"${createHash('md5').update(body).digest('hex')}"`;
+      const same =
+        head.ETag === md5 &&
+        head.ContentLength === body.length &&
+        head.ContentType === target.contentType;
+      return same ? head : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** One PUT of bytes we already hold, so the exact size is known up front. */
   async function putWhole(
     req: Request,
@@ -185,9 +241,19 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
     body: Buffer,
     abort: AbortController,
   ): Promise<S3StoredFile> {
-    let lastError: unknown;
+    const stored = (response: { ETag?: string; VersionId?: string }): S3StoredFile => {
+      report(req, file, { loaded: body.length, total: body.length, part: 1, done: true });
+      return {
+        bucket: target.bucket,
+        key: target.key,
+        size: body.length,
+        contentType: target.contentType,
+        etag: response.ETag,
+        versionId: response.VersionId,
+      };
+    };
 
-    for (let attempt = 1; attempt <= attempts; attempt++) {
+    for (let attempt = 1; ; attempt++) {
       let loaded = 0;
       try {
         const response = await options.client.send(
@@ -204,24 +270,46 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
           }),
           { abortSignal: abort.signal },
         );
-
-        report(req, file, { loaded: body.length, total: body.length, part: 1, done: true });
-        return {
-          bucket: target.bucket,
-          key: target.key,
-          size: body.length,
-          contentType: target.contentType,
-          etag: response.ETag,
-        };
+        return stored(response);
       } catch (err) {
-        lastError = err;
-        if (attempt === attempts || !isRetryable(err)) break;
+        // A refusal (4xx) stored nothing. Anything else may have.
+        if (!isRetryable(err)) throw err;
+        const found = await findStored(target, body);
+        if (found) return stored(found);
+        if (attempt >= attempts) throw err;
         // The body is rebuilt on the next pass: a consumed stream cannot be resent.
         await delay(200 * attempt);
       }
     }
+  }
 
-    throw lastError;
+  /**
+   * Deletes what `_handleFile` stored. In a versioned bucket a delete without a
+   * version only adds a delete marker: the version stored here stays, and an
+   * object the key held before this request is hidden along with it. Deleting
+   * the version undoes exactly this write.
+   *
+   * That needs `s3:DeleteObjectVersion`, and MFA Delete and Object Lock refuse
+   * it outright. Then a delete marker is the next best thing: it hides what the
+   * key held before as well, but the file this request stored, which multer is
+   * rolling back, is not left in place as the current object.
+   */
+  async function removeStored(stored: S3StoredFile): Promise<void> {
+    const remove = (VersionId?: string) =>
+      options.client.send(
+        new DeleteObjectCommand({ Bucket: stored.bucket, Key: stored.key, VersionId }),
+      );
+
+    if (!stored.versionId) {
+      await remove();
+      return;
+    }
+    try {
+      await remove(stored.versionId);
+    } catch (err) {
+      if (!isRefusal(err)) throw err;
+      await remove();
+    }
   }
 
   /**
@@ -289,7 +377,8 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
       key: target.key,
       size,
       contentType: target.contentType,
-      etag: (response as { ETag?: string }).ETag,
+      etag: response.ETag,
+      versionId: response.VersionId,
     };
   }
 
@@ -387,7 +476,7 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
         return;
       }
 
-      options.client.send(new DeleteObjectCommand({ Bucket: stored.bucket, Key: stored.key })).then(
+      removeStored(stored).then(
         () => cb(null),
         (err: Error) => cb(err),
       );

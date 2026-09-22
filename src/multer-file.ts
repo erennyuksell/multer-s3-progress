@@ -19,6 +19,8 @@ declare global {
         contentType?: string;
         /** ETag the bucket answered with. */
         etag?: string;
+        /** Version the bucket gave the object, when it keeps versions. */
+        versionId?: string;
       }
     }
   }

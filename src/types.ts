@@ -27,7 +27,8 @@ export type S3Resolver<T> = (req: Request, file: Express.Multer.File) => T | Pro
  *
  * `head` is what the engine had to buffer anyway: the whole file when it fits
  * in one part, its first `partSize` bytes when it does not. Returning undefined
- * stores the object without a content type.
+ * stores the object without a content type. Anything other than a string or
+ * undefined fails the upload.
  */
 export type S3ContentTypeResolver = (
   req: Request,
@@ -55,7 +56,10 @@ export interface S3StorageOptions {
    * Pass `AUTO_CONTENT_TYPE` to store what the bytes say instead.
    */
   contentType?: S3ContentTypeResolver;
-  /** Anything else the caller wants on the request: metadata, cache control, tags. */
+  /**
+   * Anything else the caller wants on the request: metadata, cache control, tags.
+   * Undefined adds nothing.
+   */
   params?: S3Resolver<Partial<PutObjectCommandInput>>;
   /** Bytes buffered before the upload is sent as multipart. Minimum and default 5 MiB. */
   partSize?: number;
@@ -101,4 +105,9 @@ export interface S3StoredFile {
   size: number;
   contentType?: string;
   etag?: string;
+  /**
+   * Version the bucket gave the object. Set only when the bucket keeps versions,
+   * so never on R2, which does not.
+   */
+  versionId?: string;
 }
