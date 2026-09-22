@@ -25,12 +25,26 @@ jobs:
       - run: npm test
       - run: npm run build
 
-      # The package itself claims node 18, which the test toolchain cannot run
+      # The package itself claims node 20, which the test toolchain cannot run
       # on, so what is checked there is that the built output loads.
       - uses: actions/setup-node@v5
         with:
-          node-version: 18
+          node-version: 20
       - name: the built package loads on the oldest node it claims
         run: |
           node -e "const m = require('./dist/index.cjs'); if (typeof m.s3Storage !== 'function') throw new Error('cjs export missing')"
           node --input-type=module -e "const m = await import(process.cwd() + '/dist/index.js'); if (typeof m.s3Storage !== 'function') throw new Error('esm export missing')"
+
+  # The peer ranges promise the oldest of each: the counting client leans on how
+  # the SDK sends, and AUTO_CONTENT_TYPE on what file-type exports.
+  oldest-peers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm install --no-save @aws-sdk/client-s3@3.700.0 @aws-sdk/lib-storage@3.700.0 multer@2.3.0 file-type@17
+      - run: npm test
