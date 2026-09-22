@@ -3,7 +3,7 @@
 Versions follow semver. Before 1.0 a minor version may change behavior, and
 says so here.
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-09-22)
 
 ### Changed
 
