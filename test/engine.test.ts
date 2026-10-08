@@ -339,6 +339,18 @@ describe('s3-engine', () => {
     },
   );
 
+  it('deletes the object when the bucket cannot delete by version, as R2 (501)', async () => {
+    behavior.versioned = true;
+    behavior.denyVersionDeletes = 501;
+    const engineUnderTest = engine();
+    const stored = await handle(engineUnderTest, fileFrom(bytesInChunks(4096)));
+    expect(stored.versionId).toBeDefined();
+
+    await remove(engineUnderTest, stored);
+
+    expect(objects.has(key)).toBe(false);
+  });
+
   it('reports a rollback the bucket refused altogether', async () => {
     behavior.versioned = true;
     const engineUnderTest = engine();

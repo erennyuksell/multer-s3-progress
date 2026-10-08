@@ -25,9 +25,11 @@ export interface FakeS3Behavior {
   /**
    * Refuse to delete a version: 403 AccessDenied, as AWS answers MFA Delete,
    * Object Lock or a policy without `s3:DeleteObjectVersion`, or 400
-   * InvalidRequest, as MinIO answers Object Lock. A plain delete still works.
+   * InvalidRequest, as MinIO answers Object Lock, or 501 NotImplemented, as
+   * Cloudflare R2 answers any delete that names a version even though its writes
+   * return one. A plain delete still works.
    */
-  denyVersionDeletes?: 403 | 400;
+  denyVersionDeletes?: 403 | 400 | 501;
 }
 
 /** What a read of one version of a key returns. */
@@ -58,6 +60,11 @@ const accessDenied = (res: http.ServerResponse) =>
   res
     .writeHead(403, { 'Content-Type': 'application/xml' })
     .end('<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>');
+
+const versionIdNotImplemented = (res: http.ServerResponse) =>
+  res
+    .writeHead(501, { 'Content-Type': 'application/xml' })
+    .end('<Error><Code>NotImplemented</Code><Message>versionId not implemented</Message></Error>');
 
 const wormProtected = (res: http.ServerResponse) =>
   res
@@ -181,6 +188,7 @@ export function createFakeS3(
       url.searchParams.has('versionId')
     ) {
       if (behavior.denyVersionDeletes === 400) wormProtected(res);
+      else if (behavior.denyVersionDeletes === 501) versionIdNotImplemented(res);
       else accessDenied(res);
     } else if (req.method === 'DELETE') {
       remove(key, url.searchParams.get('versionId'));

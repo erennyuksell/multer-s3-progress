@@ -176,10 +176,13 @@ function isRetryable(error: unknown): boolean {
 /**
  * A delete the bucket refused, rather than failed at: MFA Delete, Object Lock
  * and a policy without the permission answer 403 on AWS, and MinIO answers a
- * version under Object Lock with 400. A 404 is no refusal: the version is gone.
+ * version under Object Lock with 400. Cloudflare R2 returns a version id from
+ * every write but answers any delete that names one with 501 NotImplemented.
+ * A 404 is no refusal: the version is gone.
  */
 function isRefusal(error: unknown): boolean {
   const status = (error as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode;
+  if (status === 501) return true;
   return typeof status === 'number' && status >= 400 && status < 500 && status !== 404;
 }
 
