@@ -1,6 +1,6 @@
 {
   "name": "multer-s3-progress",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Multer storage engine for S3 compatible storage that reports real upload progress.",
   "keywords": [
     "multer",

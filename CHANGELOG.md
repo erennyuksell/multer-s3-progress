@@ -3,6 +3,15 @@
 Versions follow semver. Before 1.0 a minor version may change behavior, and
 says so here.
 
+## 0.2.1 (2026-10-08)
+
+### Fixed
+
+- A rollback on Cloudflare R2 deletes the object. R2 returns a version id from
+  every write but answers a delete that names one with 501 NotImplemented, and
+  0.2.0 took that for a failure: the rollback rejected and the file stayed in
+  the bucket. A 501 now falls back to a plain delete, as a refusal does.
+
 ## 0.2.0 (2026-09-22)
 
 ### Changed
