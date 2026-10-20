@@ -1,5 +1,8 @@
 # multer-s3-progress
 
+[![npm](https://img.shields.io/npm/v/multer-s3-progress)](https://www.npmjs.com/package/multer-s3-progress)
+[![license](https://img.shields.io/npm/l/multer-s3-progress)](LICENSE)
+
 A multer storage engine for S3 compatible storage that reports real upload
 progress. Written to replace `multer-s3`, which has been unmaintained since
 2022 and cannot report progress in node.
