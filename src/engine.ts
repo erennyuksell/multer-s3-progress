@@ -30,6 +30,35 @@ import type { S3StorageOptions, S3StoredFile, S3UploadProgress } from './types';
 const MIN_PART_SIZE = 5 * 1024 * 1024;
 const DEFAULT_ATTEMPTS = 3;
 
+/**
+ * What a file of a declared size has buffered before it streams: enough for a
+ * content type resolver to tell a format, a `.docx` included, whose name sits
+ * further in than file-type's default 4 KB.
+ */
+const STREAM_HEAD_SIZE = 64 * 1024;
+
+/** A file whose bytes did not add up to the size its client declared. Nothing of it is stored. */
+export class DeclaredSizeError extends Error {
+  readonly code = 'DECLARED_SIZE_MISMATCH';
+
+  constructor(
+    readonly declared: number,
+    readonly received: number,
+  ) {
+    super(
+      received > declared
+        ? `File is larger than its declared size of ${declared} bytes`
+        : `File ended at ${received} bytes, short of its declared size of ${declared}`,
+    );
+    this.name = 'DeclaredSizeError';
+  }
+}
+
+/** A size the engine can open a PUT with: a whole number of bytes. */
+function isByteCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
 interface ResolvedTarget {
   bucket: string;
   key: string;
@@ -316,6 +345,94 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
   }
 
   /**
+   * One PUT of a file whose size the client declared, opened before the bytes
+   * are here and fed as they arrive, so nothing waits on the server.
+   *
+   * The bytes are counted on the way through: past the declared size the body
+   * fails at once, and a body that ends short fails at its end. Either way the
+   * PUT is aborted rather than left for the bucket to time out on, and a PUT
+   * that does not complete stores nothing (S3 never adds a partial object; tried
+   * on R2 too). A streamed body cannot be sent again, so there is no retry here.
+   */
+  async function putStream(
+    req: Request,
+    file: Express.Multer.File,
+    target: ResolvedTarget,
+    body: Readable,
+    size: number,
+    abort: AbortController,
+  ): Promise<S3StoredFile> {
+    // The latest chunk is held back until the next one arrives or the file ends.
+    // Passed on at once, the bytes of a file longer than declared would fill the
+    // PUT to its length before the excess showed, and the bucket would store the
+    // file cut short. Held back, the PUT completes only once the file has ended
+    // exactly at its declared size.
+    let received = 0;
+    let passed = 0;
+    let held: Buffer | undefined;
+    let mismatch: DeclaredSizeError | undefined;
+    const pass = (stream: Transform, chunk: Buffer) => {
+      passed += chunk.length;
+      report(req, file, { loaded: passed, total: size, part: 1, done: false });
+      stream.push(chunk);
+    };
+    const counted = new Transform({
+      transform(chunk: Buffer, _encoding, next) {
+        received += chunk.length;
+        if (received > size) {
+          mismatch = new DeclaredSizeError(size, received);
+          next(mismatch);
+          return;
+        }
+        if (held) pass(this, held);
+        held = chunk;
+        next();
+      },
+      flush(next) {
+        if (received !== size) {
+          mismatch = new DeclaredSizeError(size, received);
+          next(mismatch);
+          return;
+        }
+        if (held) pass(this, held);
+        next();
+      },
+    });
+    body.pipe(counted);
+    finished(body, { writable: false }, (err) => {
+      if (err) counted.destroy(err);
+    });
+    // A body that fails leaves the PUT waiting for bytes that will not come.
+    counted.on('error', () => abort.abort());
+    abort.signal.addEventListener('abort', () => counted.destroy(), { once: true });
+
+    try {
+      const response = await options.client.send(
+        new PutObjectCommand({
+          ...target.extra,
+          Bucket: target.bucket,
+          Key: target.key,
+          ContentType: target.contentType,
+          ContentLength: size,
+          Body: counted,
+        }),
+        { abortSignal: abort.signal },
+      );
+      report(req, file, { loaded: size, total: size, part: 1, done: true });
+      return {
+        bucket: target.bucket,
+        key: target.key,
+        size,
+        contentType: target.contentType,
+        etag: response.ETag,
+        versionId: response.VersionId,
+      };
+    } catch (err) {
+      throw mismatch ?? err;
+    }
+  }
+
+  /**
    * Anything past one part goes to lib-storage, which retries a failed part on
    * its own. It sends over a counting client, so the bytes of a part in flight
    * are reported as they go out rather than only once the part is stored.
@@ -428,15 +545,33 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
         cb(new MulterError('LIMIT_FILE_SIZE', file.fieldname));
       };
 
-      resolveTarget(options, req as Request, file).then(
-        (base) => {
-          readUpTo(source, partSize, (readErr, head, ended, rest) => {
+      const resolveSize = async (): Promise<number | undefined> => {
+        const size = options.size ? await options.size(req as Request, file) : undefined;
+        return isByteCount(size) ? size : undefined;
+      };
+
+      Promise.all([resolveTarget(options, req as Request, file), resolveSize()]).then(
+        ([base, size]) => {
+          const fileSizeLimit = options.limits?.fileSize;
+          if (size !== undefined && fileSizeLimit !== undefined && size > fileSizeLimit) {
+            rejectOverLimit();
+            return;
+          }
+
+          // A declared size needs only the start of the file in hand, for the
+          // content type; without one the engine holds a part to learn the size.
+          const holdUpTo = size === undefined ? partSize : Math.min(STREAM_HEAD_SIZE, partSize);
+          readUpTo(source, holdUpTo, (readErr, head, ended, rest) => {
             if (readErr) {
               cb(readErr);
               return;
             }
             if (overLimit()) {
               rejectOverLimit();
+              return;
+            }
+            if (size !== undefined && ended && head.length !== size) {
+              cb(new DeclaredSizeError(size, head.length));
               return;
             }
 
@@ -449,11 +584,26 @@ export function s3Storage(options: S3StorageOptions): StorageEngine {
                 const target: ResolvedTarget = { ...base, contentType };
                 const stored = ended
                   ? putWhole(req as Request, file, target, head, abort)
-                  : putMultipart(req as Request, file, target, rest, abort);
+                  : size !== undefined
+                    ? putStream(req as Request, file, target, rest, size, abort)
+                    : putMultipart(req as Request, file, target, rest, abort);
 
                 stored.then(
                   (info) => cb(null, info as Partial<Express.Multer.File>),
-                  (err: Error) => (overLimit() ? rejectOverLimit() : cb(err)),
+                  (err: Error) => {
+                    if (overLimit()) {
+                      rejectOverLimit();
+                      return;
+                    }
+                    // A file longer than declared is still arriving: drain it, so
+                    // busboy can read past it to the rest of the body.
+                    if (err instanceof DeclaredSizeError) {
+                      rest.unpipe();
+                      rest.resume();
+                      source.resume();
+                    }
+                    cb(err);
+                  },
                 );
               },
               (err: Error) => {

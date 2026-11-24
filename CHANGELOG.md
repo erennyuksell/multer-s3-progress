@@ -3,6 +3,25 @@
 Versions follow semver. Before 1.0 a minor version may change behavior, and
 says so here.
 
+## 0.3.0 (2026-11-24)
+
+### Added
+
+- **`size`: a file whose size the client declared is streamed to the bucket as
+  it arrives**, in one PUT of that length. Without it the engine holds up to one
+  part to learn the size, so a file under `partSize` reaches the bucket only after
+  its last byte has come in, and a larger one leaves its last part to write then.
+  Against R2, a 3 MB and a 12 MB PUT streamed at 1 MB/s were stored 197 ms and
+  239 ms after their last byte.
+- `DeclaredSizeError` (`code: 'DECLARED_SIZE_MISMATCH'`): a file that ends short
+  of its declared size or runs past it. The last chunk is held back until the
+  file ends, so a longer file can never fill the PUT and be stored cut short;
+  nothing of it is stored. A declared size over `limits.fileSize` fails with
+  `LIMIT_FILE_SIZE` before a byte is read.
+
+A streamed PUT cannot be sent again, so `attempts` does not apply to it. Without
+`size` nothing changes.
+
 ## 0.2.1 (2026-10-08)
 
 ### Fixed

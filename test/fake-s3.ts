@@ -122,7 +122,9 @@ export function createFakeS3(
   return http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', 'http://fake-s3');
     const key = decodeURIComponent(url.pathname.split('/').slice(2).join('/'));
-    const body = await readBody(req);
+    // A request the client aborted never ends: like a bucket, store nothing of it.
+    const body = await readBody(req).catch(() => null);
+    if (body === null) return;
     const decoded = req.headers['x-amz-decoded-content-length'];
     const length = decoded ? Number(decoded) : body.length;
     const etag = `"${crypto.createHash('md5').update(body).digest('hex')}"`;

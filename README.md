@@ -67,6 +67,40 @@ signer hashes a buffer body to sign it and marks a streamed one
 `UNSIGNED-PAYLOAD`, so this path does not pay a SHA-256 pass over the file on
 the event loop.
 
+### A file whose size the client declared
+
+Buffering is there only to learn the size. When the client sends it before the
+file (a header such as `X-File-Size`, or a field ahead of the file part), pass it
+as `size` and the engine holds nothing:
+
+```ts
+s3Storage({
+  client,
+  bucket: 'my-bucket',
+  key: (req, file) => `${Date.now()}_${file.originalname}`,
+  size: (req) => Number(req.get('x-file-size')),
+  limits,
+});
+```
+
+It opens one `PutObject` of that length at once and passes the bytes on as they
+arrive, so the object is stored a moment after the last byte comes in, whatever
+the size: against R2, 197 ms after a 3 MB file and 239 ms after a 12 MB one, both
+sent at 1 MB/s. Buffered, a file under one part reaches the bucket only once it
+has all arrived. That is the step a client watching the progress sees as a pause
+at the end.
+
+The declared size is checked, not trusted. The latest chunk is held back until
+the next one arrives or the file ends, so the PUT completes only once the file has
+ended exactly at its declared size. A file that ends short or runs past it fails
+with `DeclaredSizeError` and the aborted PUT stores nothing: S3 never adds a
+partial object, and R2 kept nothing of a PUT cut half way or sent short when we
+tried it. A declared size over `limits.fileSize` is refused before a byte is read.
+
+A streamed PUT cannot be sent again, so `attempts` does not apply to it: a write
+the bucket fails fails the upload. A value that is not a whole number of bytes,
+or none at all, keeps the buffered path.
+
 ### Counting what lib-storage sends
 
 `lib-storage` hands each part to the SDK as a `Buffer`, and the HTTP layer

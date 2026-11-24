@@ -26,7 +26,9 @@ export type S3Resolver<T> = (req: Request, file: Express.Multer.File) => T | Pro
  * Decides the content type of a file with the start of it in hand.
  *
  * `head` is what the engine had to buffer anyway: the whole file when it fits
- * in one part, its first `partSize` bytes when it does not. Returning undefined
+ * in one part, its first `partSize` bytes when it does not. A file of a declared
+ * `size` is not buffered, so `head` is then its first 64 KiB (or all of a smaller
+ * file), which is as far as content detection needs to look. Returning undefined
  * stores the object without a content type. Anything other than a string or
  * undefined fails the upload.
  */
@@ -61,6 +63,27 @@ export interface S3StorageOptions {
    * Undefined adds nothing.
    */
   params?: S3Resolver<Partial<PutObjectCommandInput>>;
+  /**
+   * The exact size of the file, when the client declared it before sending it (a
+   * header, or a field that comes before the file).
+   *
+   * Without it the engine cannot open a PUT until it knows the size, so it holds
+   * up to one part: a file under `partSize` reaches the bucket only after its last
+   * byte has arrived, and a larger one leaves its last part to write then. With it
+   * the engine holds nothing: it opens one PUT of that length at once and passes
+   * the bytes on as they arrive, so the object is stored a moment after the last
+   * byte comes in, whatever the size.
+   *
+   * A file that turns out shorter or longer is stopped and fails with
+   * `DeclaredSizeError`; the bucket keeps nothing of a PUT that did not complete.
+   * A declared size over `limits.fileSize` fails with multer's `LIMIT_FILE_SIZE`
+   * before a byte is read. Undefined, or anything but a whole number of bytes,
+   * keeps the buffered path.
+   *
+   * The trade: a streamed PUT cannot be sent again, so `attempts` does not apply
+   * to it, and a write the bucket fails fails the upload.
+   */
+  size?: S3Resolver<number | undefined>;
   /** Bytes buffered before the upload is sent as multipart. Minimum and default 5 MiB. */
   partSize?: number;
   /** Concurrent part uploads of a multipart upload. Default 4. */

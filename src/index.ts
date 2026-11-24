@@ -8,7 +8,7 @@
 // off `req.file`.
 import './multer-file';
 
-export { s3Storage } from './engine';
+export { s3Storage, DeclaredSizeError } from './engine';
 export type {
   S3StorageOptions,
   S3StoredFile,
